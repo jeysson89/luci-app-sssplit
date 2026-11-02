@@ -63,20 +63,30 @@ jobs:
           # keep stable filename for install.sh (releases/latest/download/luci-app-sssplit_all.ipk)
           cp dist/luci-app-sssplit_${{ steps.ver.outputs.ver }}_all.ipk dist/luci-app-sssplit_all.ipk
           gh release upload "${{ steps.ver.outputs.tag }}" --clobber dist/luci-app-sssplit_all.ipk
-          # ship the rust engine (sslocal) ipk in every release: the ctl default
-          # rust_url points to releases/latest/download/sslocal-...ipk, and
-          # passwall2 bundles ipks in zips now, so re-host it here
+          # ship engine ipk assets in every release (ctl/install.sh reference
+          # them via releases/latest/download/...):
+          #  - sslocal: passwall2 now bundles ipks in zips, re-host ours here
+          #  - ipt2socks: not in the stock OpenWrt feeds at all
           pwtag=$(curl -sq https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
           echo "passwall2 latest: $pwtag"
           curl -sL -o /tmp/pw.zip "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/${pwtag}/packages_ipk_mipsel_24kc.zip" || true
-          sslocal=$(cd /tmp && python3 - /tmp/pw.zip <<'PYEOF'
-          import sys, zipfile
-          z = zipfile.ZipFile(sys.argv[1])
-          n = [x for x in z.namelist() if 'sslocal' in x][0]
-          z.extract(n, '/tmp')
-          print('/tmp/' + n)
+          python3 - <<'PYEOF'
+          import zipfile
+          with zipfile.ZipFile('/tmp/pw.zip') as z:
+              n = [x for x in z.namelist() if 'sslocal' in x][0]
+              z.extract(n, '/tmp')
+          import shutil, glob
+          src = glob.glob('/tmp/**/shadowsocks-rust-sslocal*', recursive=True)[0]
+          shutil.move(src, '/tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk')
+          print('sslocal ipk extracted')
           PYEOF
-          )
-          [ -s "$sslocal" ] && mv "$sslocal" /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk && ls -la /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk
-          gh release upload "${{ steps.ver.outputs.tag }}" --clobber /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk \
-          || echo "WARN: sslocal asset upload skipped"
+          IPT2SOCKS_URL="https://github.com/kenzok8/small/releases/download/18-mipsel_24kc-24.10.5/ipt2socks_1.1.4-r3_mipsel_24kc.ipk"
+          curl -sL -o /tmp/ipt2socks-1.1.4-r3_mipsel_24kc.ipk "$IPT2SOCKS_URL" || true
+          for a in /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk /tmp/ipt2socks-1.1.4-r3_mipsel_24kc.ipk; do
+              if [ -s "$a" ]; then
+                  gh release upload "${{ steps.ver.outputs.tag }}" --clobber "$a" && echo "uploaded $a" \
+                  || echo "WARN: could not upload $a"
+              else
+                  echo "WARN: $a missing, skipped"
+              fi
+          done

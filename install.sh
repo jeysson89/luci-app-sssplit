@@ -42,7 +42,15 @@ say "opkg update"
 opkg update >/dev/null 2>&1
 
 say "installing dependencies (ipt2socks + https-dns-proxy are required)"
-opkg install ipt2socks                    >/dev/null 2>&1 || opkg install ipt2socks || { echo "ERR: ipt2socks"; exit 1; }
+# ipt2socks is NOT in the stock OpenWrt feeds (it comes from the passwall
+# ecosystem); try opkg first, fall back to the ipk shipped in our releases
+opkg install ipt2socks >/dev/null 2>&1 || {
+	say "ipt2socks not in feed, fetching from $BASE"
+	wget -q -T 65 -O /tmp/ipt2socks.ipk "$BASE/ipt2socks-1.1.4-r3_mipsel_24kc.ipk" \
+		&& opkg install /tmp/ipt2socks.ipk >/dev/null 2>&1 \
+		|| { echo "ERR: ipt2socks"; exit 1; }
+}
+opkg list-installed | grep -q '^ipt2socks ' || { echo "ERR: ipt2socks not installed (required)"; exit 1; }
 opkg install luci-app-https-dns-proxy     >/dev/null 2>&1 || true
 # DoH is mandatory for this app: ctl configures/restarts https-dns-proxy and
 # the Status tab reports it; fail the whole install when it is missing
