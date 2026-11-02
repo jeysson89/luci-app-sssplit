@@ -70,7 +70,7 @@ rm -f "$OUT/${PKG}_${VER}_all.ipk" "$OUT/${PKG}_all.ipk"
 
 # pack the ar container in (pure) python: GNU ar writes member names with a
 # trailing '/' ("control.tar.gz/"), which opkg rejects as a malformed package
-python3 - "$OUT/${PKG}_${VER}_all.ipk" <<'PYEOF'
+( cd "$BUILD" && python3 - "$OUT/${PKG}_${VER}_all.ipk" <<'PYEOF'
 import sys, os
 out, names = sys.argv[1], ['debian-binary', 'control.tar.gz', 'data.tar.gz']
 with open(out, 'wb') as f:
@@ -85,5 +85,6 @@ with open(out, 'wb') as f:
         hdr += b'`\n'
         f.write(hdr + d + (b'\n' if len(d) % 2 else b''))
 PYEOF
+)
 cp -f "$OUT/${PKG}_${VER}_all.ipk" "$OUT/${PKG}_all.ipk"
 echo "Built: dist/${PKG}_${VER}_all.ipk"
