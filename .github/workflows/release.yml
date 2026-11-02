@@ -31,10 +31,27 @@ jobs:
       - name: smoke test archive
         run: |
           cd dist
-          ar t luci-app-sssplit_*.ipk | grep -E 'debian-binary|control.tar.gz|data.tar.gz'
-          mkdir t && cd t && ar x ../luci-app-sssplit_*.ipk
-          tar -tzf control.tar.gz | grep -E './control'
-          tar -tzf data.tar.gz   | grep -E './usr/bin/sssplit-ctl'
+          # opkg requires ar member names WITHOUT trailing slash (GNU ar writes
+          # "control.tar.gz/" which opkg rejects) — verify with pure python
+          python3 - luci-app-sssplit_*.ipk <<'PYEOF'
+          import sys
+          names = ['debian-binary', 'control.tar.gz', 'data.tar.gz']
+          data = open(sys.argv[1], 'rb').read()
+          assert data[:8] == b'!<arch>\n', 'not an ar archive'
+          pos, seen = 8, []
+          for want in names:
+              hdr = data[pos:pos+60]
+              name = hdr[:16].decode().strip()
+              size = int(hdr[48:58].decode().strip())
+              assert name == want, f'bad member name: {name!r} (trailing slash?)'
+              pos += 60 + size + (size & 1)
+              seen.append(name)
+              open(want, 'wb').write(data[pos-size:pos])
+          assert seen == names, seen
+          print('ar members OK:', ', '.join(seen))
+          PYEOF
+          tar -tzf control.tar.gz | grep -E '^\./control$'
+          tar -tzf data.tar.gz   | grep -E '^\./usr/bin/sssplit-ctl$'
           tar -xzOf data.tar.gz ./usr/bin/sssplit-ctl | sh -n && echo "ctl syntax OK"
           tar -xzOf control.tar.gz ./postinst | sh -n && echo "postinst syntax OK"
 
