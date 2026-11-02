@@ -41,25 +41,27 @@ say() { echo "==> $1"; }
 say "opkg update"
 opkg update >/dev/null 2>&1
 
-say "installing dependencies (ipt2socks + https-dns-proxy are required)"
-# ipt2socks is NOT in the stock OpenWrt feeds (it comes from the passwall
-# ecosystem); try opkg first, fall back to the ipk shipped in our releases
-opkg install ipt2socks >/dev/null 2>&1 || {
-	say "ipt2socks not in feed, fetching from $BASE"
-	wget -q -T 65 -O /tmp/ipt2socks.ipk "$BASE/ipt2socks-1.1.4-r3_mipsel_24kc.ipk" \
-		&& opkg install /tmp/ipt2socks.ipk >/dev/null 2>&1 \
-		|| { echo "ERR: ipt2socks"; exit 1; }
+say "installing dependencies (all have a bundled copy in our releases)"
+# helper: try opkg feed first, fall back to the ipk asset shipped in our
+# releases (ipt2socks & shadowsocksr are NOT in the stock OpenWrt feeds)
+dep() {
+	p="$1" a="$2"
+	opkg install "$p" >/dev/null 2>&1 || {
+		[ -n "$a" ] || return 1
+		wget -q -T 65 -O /tmp/dep.ipk "$BASE/$a" || return 1
+		opkg install /tmp/dep.ipk >/dev/null 2>&1 || return 1
+	}
+	opkg list-installed 2>/dev/null | grep -q "^$p "
 }
-opkg list-installed | grep -q '^ipt2socks ' || { echo "ERR: ipt2socks not installed (required)"; exit 1; }
-opkg install luci-app-https-dns-proxy     >/dev/null 2>&1 || true
+dep ipt2socks ipt2socks-1.1.4-r3_mipsel_24kc.ipk || { echo "ERR: ipt2socks (required)"; exit 1; }
 # DoH is mandatory for this app: ctl configures/restarts https-dns-proxy and
 # the Status tab reports it; fail the whole install when it is missing
-opkg install https-dns-proxy              >/dev/null 2>&1 || opkg install https-dns-proxy || { echo "ERR: https-dns-proxy (required)"; exit 1; }
-opkg list-installed | grep -q '^https-dns-proxy ' || { echo "ERR: https-dns-proxy not installed (required)"; exit 1; }
-# ssr engine fallback (AEAD engines need sslocal/rust instead)
-opkg install shadowsocksr-libev-ssr-redir >/dev/null 2>&1 \
-	|| opkg install shadowsocksr-libev    >/dev/null 2>&1 \
-	|| echo "WARN: shadowsocksr not found (fine — use the rust/engine for AEAD)"
+dep https-dns-proxy https-dns-proxy_2026.05.06-r1_mipsel_24kc.ipk || { echo "ERR: https-dns-proxy (required)"; exit 1; }
+dep luci-app-https-dns-proxy luci-app-https-dns-proxy_2026.05.06-r1_all.ipk || true
+# ssr engine bits (optional fallback engine; rust/sslocal is the main one)
+dep shadowsocksr-libev-ssr-redir shadowsocksr-libev-ssr-redir_2.5.10-r1_mipsel_24kc.ipk || \
+	echo "WARN: ssr engine unavailable (use the rust engine for AEAD)"
+dep shadowsocksr-libev-ssr-server shadowsocksr-libev-ssr-server_2.5.10-r1_mipsel_24kc.ipk || true
 
 say "downloading $REPO release ipk"
 dl_ok=0

@@ -82,7 +82,21 @@ jobs:
           PYEOF
           IPT2SOCKS_URL="https://github.com/kenzok8/small/releases/download/18-mipsel_24kc-24.10.5/ipt2socks_1.1.4-r3_mipsel_24kc.ipk"
           curl -sL -o /tmp/ipt2socks-1.1.4-r3_mipsel_24kc.ipk "$IPT2SOCKS_URL" || true
-          for a in /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk /tmp/ipt2socks-1.1.4-r3_mipsel_24kc.ipk; do
+          # optional ssr engine bits (not in stock feeds either)
+          for f in shadowsocksr-libev-ssr-redir_2.5.10-r1_mipsel_24kc.ipk \
+                   shadowsocksr-libev-ssr-server_2.5.10-r1_mipsel_24kc.ipk; do
+              curl -sL -o "/tmp/$f" "https://github.com/kenzok8/small/releases/download/18-mipsel_24kc-24.10.5/$f" || true
+          done
+          # stock-feed packages: https-dns-proxy (required) + its luci app
+          curl -sL -o /tmp/https-dns-proxy_2026.05.06-r1_mipsel_24kc.ipk \
+              "https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/packages/https-dns-proxy_2026.05.06-r1_mipsel_24kc.ipk" || true
+          curl -sL -o /tmp/luci-app-https-dns-proxy_2026.05.06-r1_all.ipk \
+              "https://downloads.openwrt.org/releases/24.10.0/packages/mipsel_24kc/luci/luci-app-https-dns-proxy_2026.05.06-r1_all.ipk" || true
+          for a in /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk /tmp/ipt2socks-1.1.4-r3_mipsel_24kc.ipk \
+                   /tmp/shadowsocksr-libev-ssr-redir_2.5.10-r1_mipsel_24kc.ipk \
+                   /tmp/shadowsocksr-libev-ssr-server_2.5.10-r1_mipsel_24kc.ipk \
+                   /tmp/https-dns-proxy_2026.05.06-r1_mipsel_24kc.ipk \
+                   /tmp/luci-app-https-dns-proxy_2026.05.06-r1_all.ipk; do
               if [ -s "$a" ]; then
                   gh release upload "${{ steps.ver.outputs.tag }}" --clobber "$a" && echo "uploaded $a" \
                   || echo "WARN: could not upload $a"
