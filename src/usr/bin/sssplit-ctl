@@ -132,11 +132,15 @@ EOF
 		# sslocal is a SOCKS5 proxy; ipt2socks bridges transparent REDIRECT/TPROXY traffic to it.
 		# -R: our nft table uses REDIRECT for TCP (not TPROXY), so ipt2socks must read the
 		# original destination via SO_ORIGINAL_DST.
+		# NOTE: no `setsid` here — busybox setsid may fork and then $! points to the wrong
+		# pid. Plain background jobs survive ctl exit (re-parented to init).
 		I2S="ipt2socks -l $TP -b 0.0.0.0 -R -s 127.0.0.1 -p $SOCKSP"
-		[ "$UDP_ON" = "1" ] && I2S="$I2S -u"
-		setsid /tmp/sslocal -c $RUN/rust.json >/dev/null 2>&1 &
+		# this ipt2socks does tcp+udp by default; -u means "--run-user", so
+		# to disable udp we pass -T (--tcp-only) instead
+		[ "$UDP_ON" != "1" ] && I2S="$I2S -T"
+		/tmp/sslocal -c $RUN/rust.json >/dev/null 2>&1 &
 		echo $! > $RUN/socks.pid
-		setsid $I2S >/dev/null 2>&1 &
+		$I2S >/dev/null 2>&1 &
 		echo $! > $RUN/proxy.pid
 	else
 		CMD="ssr-redir -b 0.0.0.0 -s $SHOST -p $SPORT -l $TP -m $SMETHOD -k $SPASS -t 900"
@@ -167,6 +171,10 @@ stop_engine()
 		kill "$(cat $RUN/ssrserver.pid)" 2>/dev/null
 		rm -f $RUN/ssrserver.pid
 	fi
+	# clean up stale instances (wrong port / escaped pidfile)
+	for bin in ipt2socks sslocal; do
+		killall "$bin" 2>/dev/null
+	done
 }
 
 # ---------------------------------------------------------------- nftables
@@ -193,6 +201,8 @@ gen_nft()
 		fi
 	done
 
+	ok=""
+	for style in ip legacy tcp; do
 	{
 		echo "table inet $NFT_NAME {"
 		echo "	set bypass_v4 { type ipv4_addr; flags interval; auto-merge; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } }"
@@ -222,26 +232,31 @@ gen_nft()
 			echo "		counter meta l4proto tcp redirect to :$TP"
 		fi
 		echo "	}"
-		if [ "$UDP_ON" = "1" ]; then
+		if [ "$UDP_ON" = "1" ] && [ "$style" != "tcp" ]; then
+			# kernel compatibility: some nft versions require the explicit ip
+			# family on tproxy, some choke on it; last resort is tcp only
+			F=tproxy; [ "$style" = "ip" ] && F="tproxy ip"
 			echo "	chain udpmangle {"
 			echo "		type filter hook prerouting priority -155; policy accept;"
 			echo "		ip saddr @hostdirect_v4 return"
-			echo "		ip6 saddr @hostdirect_v6 return"
-			echo "		ip saddr @hostproxy_v4 counter meta l4proto udp tproxy to :$TP mark 1"
-			echo "		ip6 saddr @hostproxy_v6 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "		ip saddr @hostproxy_v4 counter meta l4proto udp $F to :$TP mark 1"
 			echo "		ip daddr @bypass_v4 return"
-			echo "		ip6 daddr @bypass_v6 return"
 			echo "		ip daddr @destdirect_v4 return"
-			echo "		ip6 daddr @destdirect_v6 return"
-			echo "		ip daddr @destproxy_v4 counter meta l4proto udp tproxy to :$TP mark 1"
-			echo "		ip6 daddr @destproxy_v6 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "		ip daddr @destproxy_v4 counter meta l4proto udp $F to :$TP mark 1"
 			echo "	}"
 		fi
 		echo "}"
 	} > $RUN/spec.nft
 
-	nft delete table inet $NFT_NAME >/dev/null 2>&1
-	nft -f $RUN/spec.nft || { log "ERROR: nft apply failed"; return 1; }
+		nft delete table inet $NFT_NAME >/dev/null 2>&1
+		if nft -f $RUN/spec.nft >/dev/null 2>&1; then
+			ok="$style"
+			break
+		fi
+		[ "$style" != "tcp" ] && log "udp tproxy style '$style' rejected, falling back"
+	done
+	[ -z "$ok" ] && { log "ERROR: nft apply failed"; return 1; }
+	[ "$ok" = "tcp" ] && log "note: udp tproxy unavailable, TCP routing only"
 
 	fill_set hostproxy_v4 $RUN/hostproxy_v4
 	fill_set hostdirect_v4 $RUN/hostdirect_v4

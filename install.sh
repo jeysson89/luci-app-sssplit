@@ -20,6 +20,7 @@ set -u
 
 GH_USER="${1:-jeysson89}"
 case "$GH_USER" in ""|_*|-*|\$*) echo "usage: sh install.sh <github-user>"; exit 1 ;; esac
+PKG="luci-app-sssplit"
 REPO="$GH_USER/luci-app-sssplit"
 BASE="https://github.com/$REPO/releases/latest/download"
 IPK="luci-app-sssplit_all.ipk"
