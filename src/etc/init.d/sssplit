@@ -1,0 +1,13 @@
+#!/bin/sh /etc/rc.common
+# luci-app-sssplit init script
+
+START=99
+STOP=10
+
+start(){
+	/usr/bin/sssplit-ctl apply >/dev/null 2>&1 &
+}
+
+stop(){
+	/usr/bin/sssplit-ctl stop >/dev/null 2>&1
+}

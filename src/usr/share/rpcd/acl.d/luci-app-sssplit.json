@@ -1,0 +1,28 @@
+{
+	"luci-app-sssplit": {
+		"description": "Grant access to SS Split routing",
+		"read": {
+			"file": {
+				"/usr/bin/sssplit-ctl status": [ "exec" ],
+				"/usr/bin/sssplit-ctl test": [ "exec" ],
+				"/usr/bin/sssplit-ctl dns-status": [ "exec" ],
+				"/etc/sssplit/*": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec" ],
+				"luci": [ "getFeatures" ]
+			},
+			"uci": [ "sssplit" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/sssplit-ctl *": [ "exec" ],
+				"/etc/sssplit/*": [ "write" ]
+			},
+			"ubus": {
+				"file": [ "write", "exec" ]
+			},
+			"uci": [ "sssplit" ]
+		}
+	}
+}

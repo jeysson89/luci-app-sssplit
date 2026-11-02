@@ -1,0 +1,61 @@
+{
+	"admin/services/sssplit": {
+		"title": "SS Split",
+		"order": 92,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-sssplit" ],
+			"uci": { "sssplit": true }
+		}
+	},
+	"admin/services/sssplit/status": {
+		"title": "Статус",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "sssplit/status"
+		}
+	},
+	"admin/services/sssplit/servers": {
+		"title": "Серверы",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "sssplit/servers"
+		}
+	},
+	"admin/services/sssplit/rules": {
+		"title": "Списки доменов и IP",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "sssplit/rules"
+		}
+	},
+	"admin/services/sssplit/dns": {
+		"title": "DNS (DoH)",
+		"order": 35,
+		"action": {
+			"type": "view",
+			"path": "sssplit/dns"
+		}
+	},
+	"admin/services/sssplit/clients": {
+		"title": "Клиенты",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "sssplit/clients"
+		}
+	},
+	"admin/services/sssplit/settings": {
+		"title": "Настройки",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "sssplit/settings"
+		}
+	}
+}

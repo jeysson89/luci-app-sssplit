@@ -1,0 +1,53 @@
+name: build and release ipk
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: derive version from tag
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "ver=${GITHUB_REF#refs/tags/v}-1" >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ver=1.0.0-0$(date +%Y%m%d%H%M%S)" >> "$GITHUB_OUTPUT"
+            echo "tag=v1.0.0-1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build ipk
+        run: sh build/build-ipk.sh "${{ steps.ver.outputs.ver }}"
+
+      - name: smoke test archive
+        run: |
+          cd dist
+          ar t luci-app-sssplit_*.ipk | grep -E 'debian-binary|control.tar.gz|data.tar.gz'
+          mkdir t && cd t && ar x ../luci-app-sssplit_*.ipk
+          tar -tzf control.tar.gz | grep -E './control'
+          tar -tzf data.tar.gz   | grep -E './usr/bin/sssplit-ctl'
+          tar -xzOf data.tar.gz ./usr/bin/sssplit-ctl | sh -n && echo "ctl syntax OK"
+          tar -xzOf control.tar.gz ./postinst | sh -n && echo "postinst syntax OK"
+
+      - name: create release and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+              --title "${{ steps.ver.outputs.tag }}" \
+              --generate-notes \
+              dist/luci-app-sssplit_${{ steps.ver.outputs.ver }}_all.ipk \
+          || ( gh release upload "${{ steps.ver.outputs.tag }}" --clobber \
+               dist/luci-app-sssplit_${{ steps.ver.outputs.ver }}_all.ipk )
+          # keep stable filename for install.sh (releases/latest/download/luci-app-sssplit_all.ipk)
+          cp dist/luci-app-sssplit_${{ steps.ver.outputs.ver }}_all.ipk dist/luci-app-sssplit_all.ipk
+          gh release upload "${{ steps.ver.outputs.tag }}" --clobber dist/luci-app-sssplit_all.ipk

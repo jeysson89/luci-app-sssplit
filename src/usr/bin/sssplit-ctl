@@ -1,0 +1,1023 @@
+#!/bin/sh
+# sssplit-ctl — control utility for split routing via Shadowsocks
+# Part of luci-app-sssplit. Works on BusyBox ash, uses own nft table (no fw4 conflicts).
+
+BASE="/etc/sssplit"
+RUN="/var/run/sssplit"
+NFT_NAME="sssplit"
+CFG="sssplit"
+
+log(){ logger -t sssplit "$1"; }
+
+gget(){ uci -q get "$CFG.$1" 2>/dev/null || echo "$2"; }
+
+load_cfg()
+{
+	ENABLED=$(gget global.enabled 0)
+	ENGINE=$(gget global.engine ssr)
+	MODE=$(gget global.mode by_list)
+	TP=$(gget global.tcp_port 1080)
+	UP=$(gget global.udp_port 1090)
+	UDP_ON=$(gget global.udp_relay 0)
+	IPV6G=$(gget global.ipv6 0)
+	RUST_URL=$(gget global.rust_url "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/26.10.29-1/shadowsocks-rust-sslocal_1.25.0-r1_mipsel_24kc.ipk")
+
+	SRV=""
+	# in auto mode the running server is the one auto_pick marked "active";
+	# in manual mode it is the server flagged "enabled"
+	if [ "$(gget global.pick manual)" = "auto" ]; then
+		for s in $(uci -q show "$CFG" 2>/dev/null | sed -n 's/^sssplit\.\(.*\)=server$/\1/p'); do
+			if [ "$(uci -q get $CFG.$s.active)" = "1" ]; then SRV="$s"; break; fi
+		done
+	fi
+	if [ -z "$SRV" ]; then
+		for s in $(uci -q show "$CFG" 2>/dev/null | sed -n 's/^sssplit\.\(.*\)=server$/\1/p'); do
+			if [ "$(uci -q get $CFG.$s.enabled)" = "1" ]; then SRV="$s"; break; fi
+		done
+	fi
+	if [ -n "$SRV" ]; then
+		SHOST=$(uci -q get $CFG.$SRV.host)
+		SPORT=$(uci -q get $CFG.$SRV.port)
+		SMETHOD=$(uci -q get $CFG.$SRV.method)
+		SPASS=$(uci -q get $CFG.$SRV.password)
+		SPROTO=$(uci -q get $CFG.$SRV.protocol)
+		SOBF=$(uci -q get $CFG.$SRV.obfs)
+		SPROTOP=$(uci -q get $CFG.$SRV.protocol_param)
+		SOBFP=$(uci -q get $CFG.$SRV.obfs_param)
+	else
+		SHOST=""; SPORT=""; SMETHOD=""; SPASS=""
+		SPROTO="origin"; SOBF="plain"; SPROTOP=""; SOBFP=""
+	fi
+}
+
+# ---------------------------------------------------------------- engine
+prepare_rust()
+{
+	[ -x /tmp/sslocal ] && return 0
+	if [ -s /tmp/sslocal.ipk ] || [ -s $BASE/pkgs/sslocal.ipk ]; then
+		PKG=$BASE/pkgs/sslocal.ipk
+		[ -s /tmp/sslocal.ipk ] && PKG=/tmp/sslocal.ipk
+		mkdir -p /tmp/.ssex
+		tar -xzf $PKG -C /tmp/.ssex 2>/dev/null || rm -rf /tmp/.ssex
+		if [ -f /tmp/.ssex/data.tar.gz ]; then
+			tar -xzf /tmp/.ssex/data.tar.gz -C /tmp/.ssex 2>/dev/null
+			cp /tmp/.ssex/usr/bin/sslocal /tmp/sslocal && rm -rf /tmp/.ssex
+		elif [ -s $BASE/pkgs/sslocal.ipk ]; then
+			rm -f $BASE/pkgs/sslocal.ipk
+		fi
+	fi
+	if [ ! -x /tmp/sslocal ]; then
+		log "rust engine: downloading ipk ..."
+		mkdir -p /tmp/.dw
+		wget -q -O /tmp/.dw/sslocal.ipk "$RUST_URL" || { rm -rf /tmp/.dw; return 1; }
+		mkdir -p /tmp/.ssex
+		tar -xzf /tmp/.dw/sslocal.ipk -C /tmp/.ssex
+		tar -xzf /tmp/.ssex/data.tar.gz -C /tmp/.ssex
+		cp /tmp/.ssex/usr/bin/sslocal /tmp/sslocal
+		rm -rf /tmp/.ssex
+		AVAIL=$(df / 2>/dev/null | tail -1 | awk '{print $4}')
+		if [ -n "$AVAIL" ] && [ "$AVAIL" -gt 4500 ]; then
+			log "caching rust ipk in flash"
+			mv /tmp/.dw/sslocal.ipk $BASE/pkgs/sslocal.ipk
+		else
+			log "low flash space: rust ipk kept in RAM only"
+		fi
+		rm -rf /tmp/.dw
+	fi
+	[ -x /tmp/sslocal ] || return 1
+	chmod +x /tmp/sslocal
+	return 0
+}
+
+engine_alive()
+{
+	[ -s "$1" ] && kill -0 "$(cat $1)" 2>/dev/null
+}
+
+start_local_server()
+{
+	[ "$SHOST" = "127.0.0.1" ] || [ "$SHOST" = "localhost" ] || return 0
+	engine_alive $RUN/ssrserver.pid && return 0
+	SSRCMD="ssr-server -s 127.0.0.1 -p $SPORT -m $SMETHOD -k $SPASS"
+	[ -n "$SPROTO" ] && [ "$SPROTO" != "origin" ] && SSRCMD="$SSRCMD -O $SPROTO"
+	[ -n "$SOBF" ] && [ "$SOBF" != "plain" ] && SSRCMD="$SSRCMD -o $SOBF"
+	$SSRCMD -f $RUN/ssrserver.pid
+	log "local test ss-server started on 127.0.0.1:$SPORT"
+}
+
+start_engine()
+{
+	mkdir -p $RUN
+	stop_engine
+	if [ "$ENGINE" = "rust" ]; then
+		if ! prepare_rust; then
+			log "ERROR: rust binary missing, run: sssplit-ctl install-rust"
+			return 1
+		fi
+		MODEJ="tcp_only"
+		[ "$UDP_ON" = "1" ] && MODEJ="tcp_and_udp"
+		SOCKSP=$((TP + 1))
+		cat > $RUN/rust.json <<EOF
+{
+	"server": "$SHOST",
+	"server_port": $SPORT,
+	"local_address": "127.0.0.1",
+	"local_port": $SOCKSP,
+	"password": "$SPASS",
+	"method": "$SMETHOD",
+	"timeout": 300,
+	"mode": "$MODEJ"
+}
+EOF
+		# sslocal is a SOCKS5 proxy; ipt2socks bridges transparent REDIRECT/TPROXY traffic to it.
+		# -R: our nft table uses REDIRECT for TCP (not TPROXY), so ipt2socks must read the
+		# original destination via SO_ORIGINAL_DST.
+		I2S="ipt2socks -l $TP -b 0.0.0.0 -R -s 127.0.0.1 -p $SOCKSP"
+		[ "$UDP_ON" = "1" ] && I2S="$I2S -u"
+		setsid /tmp/sslocal -c $RUN/rust.json >/dev/null 2>&1 &
+		echo $! > $RUN/socks.pid
+		setsid $I2S >/dev/null 2>&1 &
+		echo $! > $RUN/proxy.pid
+	else
+		CMD="ssr-redir -b 0.0.0.0 -s $SHOST -p $SPORT -l $TP -m $SMETHOD -k $SPASS -t 900"
+		[ "$SPROTO" != "origin" ] && CMD="$CMD -O $SPROTO"
+		[ -n "$SPROTOP" ] && CMD="$CMD -G $SPROTP"
+		[ "$SOBF" != "plain" ] && CMD="$CMD -o $SOBF"
+		[ -n "$SOBFP" ] && CMD="$CMD -g $SOBFP"
+		[ "$UDP_ON" = "1" ] && CMD="$CMD -u"
+		$CMD -f $RUN/proxy.pid
+	fi
+	sleep 1
+	engine_alive $RUN/proxy.pid && { start_local_server; return 0; }
+	log "ERROR: proxy engine failed to start"
+	return 1
+}
+
+stop_engine()
+{
+	if [ -s $RUN/proxy.pid ]; then
+		kill "$(cat $RUN/proxy.pid)" 2>/dev/null
+		rm -f $RUN/proxy.pid
+	fi
+	if [ -s $RUN/socks.pid ]; then
+		kill "$(cat $RUN/socks.pid)" 2>/dev/null
+		rm -f $RUN/socks.pid
+	fi
+	if [ -s $RUN/ssrserver.pid ]; then
+		kill "$(cat $RUN/ssrserver.pid)" 2>/dev/null
+		rm -f $RUN/ssrserver.pid
+	fi
+}
+
+# ---------------------------------------------------------------- nftables
+fill_set()
+{
+	SET="$1" FILE="$2" ELEMS=""
+	[ -s "$FILE" ] || return 0
+	ELEMS=$(awk '!/^#/&&NF{printf "%s,",$1}' "$FILE" | sed 's/,$//')
+	[ -n "$ELEMS" ] && nft add element inet $NFT_NAME "$SET" { "$ELEMS" } >/dev/null 2>&1
+}
+
+gen_nft()
+{
+	touch $RUN/ipproxy_v4 $RUN/ipdirect_v4 $RUN/ipproxy_v6 $RUN/ipdirect_v6 $RUN/hostproxy_v4 $RUN/hostdirect_v4
+	in6() { echo "$1" | grep ':' >/dev/null; }
+	for h in $(uci -q show "$CFG" 2>/dev/null | sed -n 's/^sssplit\.\(.*\)=hostrule$/\1/p'); do
+		HIP=$(uci -q get $CFG.$h.ip)
+		[ -n "$HIP" ] || continue
+		HPOL=$(uci -q get $CFG.$h.policy)
+		if in6 "$HIP"; then
+			[ "$HPOL" = "direct" ] && echo "$HIP" >> $RUN/hostdirect_v6 || echo "$HIP" >> $RUN/hostproxy_v6
+		else
+			[ "$HPOL" = "direct" ] && echo "$HIP" >> $RUN/hostdirect_v4 || echo "$HIP" >> $RUN/hostproxy_v4
+		fi
+	done
+
+	{
+		echo "table inet $NFT_NAME {"
+		echo "	set bypass_v4 { type ipv4_addr; flags interval; auto-merge; elements = { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } }"
+		echo "	set bypass_v6 { type ipv6_addr; flags interval; auto-merge; elements = { ::1/128, fc00::/7, fe80::/10, ff00::/8 } }"
+		echo "	set destproxy_v4 { type ipv4_addr; flags interval; auto-merge; }"
+		echo "	set destdirect_v4 { type ipv4_addr; flags interval; auto-merge; }"
+		echo "	set destproxy_v6 { type ipv6_addr; flags interval; auto-merge; }"
+		echo "	set destdirect_v6 { type ipv6_addr; flags interval; auto-merge; }"
+		echo "	set hostproxy_v4 { type ipv4_addr; flags interval; auto-merge; }"
+		echo "	set hostdirect_v4 { type ipv4_addr; flags interval; auto-merge; }"
+		echo "	set hostproxy_v6 { type ipv6_addr; flags interval; auto-merge; }"
+		echo "	set hostdirect_v6 { type ipv6_addr; flags interval; auto-merge; }"
+		echo "	chain dstnat {"
+		echo "		type nat hook prerouting priority -95; policy accept;"
+		echo "		ip saddr @hostdirect_v4 return"
+		echo "		ip6 saddr @hostdirect_v6 return"
+		echo "		counter ip saddr @hostproxy_v4 meta l4proto tcp redirect to :$TP"
+		echo "		counter ip6 saddr @hostproxy_v6 meta l4proto tcp redirect to :$TP"
+		echo "		ip daddr @bypass_v4 return"
+		echo "		ip6 daddr @bypass_v6 return"
+		echo "		ip daddr @destdirect_v4 return"
+		echo "		ip6 daddr @destdirect_v6 return"
+		if [ "$MODE" = "by_list" ]; then
+			echo "		counter ip daddr @destproxy_v4 meta l4proto tcp redirect to :$TP"
+			echo "		counter ip6 daddr @destproxy_v6 meta l4proto tcp redirect to :$TP"
+		else
+			echo "		counter meta l4proto tcp redirect to :$TP"
+		fi
+		echo "	}"
+		if [ "$UDP_ON" = "1" ]; then
+			echo "	chain udpmangle {"
+			echo "		type filter hook prerouting priority -155; policy accept;"
+			echo "		ip saddr @hostdirect_v4 return"
+			echo "		ip6 saddr @hostdirect_v6 return"
+			echo "		ip saddr @hostproxy_v4 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "		ip6 saddr @hostproxy_v6 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "		ip daddr @bypass_v4 return"
+			echo "		ip6 daddr @bypass_v6 return"
+			echo "		ip daddr @destdirect_v4 return"
+			echo "		ip6 daddr @destdirect_v6 return"
+			echo "		ip daddr @destproxy_v4 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "		ip6 daddr @destproxy_v6 counter meta l4proto udp tproxy to :$TP mark 1"
+			echo "	}"
+		fi
+		echo "}"
+	} > $RUN/spec.nft
+
+	nft delete table inet $NFT_NAME >/dev/null 2>&1
+	nft -f $RUN/spec.nft || { log "ERROR: nft apply failed"; return 1; }
+
+	fill_set hostproxy_v4 $RUN/hostproxy_v4
+	fill_set hostdirect_v4 $RUN/hostdirect_v4
+	fill_set destproxy_v4 $BASE/proxy_ip.list
+	fill_set destdirect_v4 $BASE/direct_ip.list
+	if [ "$IPV6G" = "1" ]; then
+		fill_set hostproxy_v6 $RUN/hostproxy_v6
+		fill_set hostdirect_v6 $RUN/hostdirect_v6
+		fill_set destproxy_v6 $BASE/proxy_ip6.list
+		fill_set destdirect_v6 $BASE/direct_ip6.list
+	fi
+
+	if [ "$UDP_ON" = "1" ]; then
+		ip rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100' || ip rule add fwmark 1 table 100 2>/dev/null
+		ip route show table 100 2>/dev/null | grep -q 'local default' || ip route add local default dev lo table 100 2>/dev/null
+	else
+		ip rule del fwmark 1 table 100 2>/dev/null
+		ip route del local default dev lo table 100 2>/dev/null
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- dns
+strip_old_dns(){ awk 'BEGIN{p=1}/SSSPLIT-BEGIN/{p=0;next}/SSSPLIT-END/{p=1;next}p' /etc/dnsmasq.conf; }
+
+dns_line()
+{
+	D=$(awk '!/^#/&&NF{printf "%s,",$1}' "$1" | sed 's/,$//')
+	[ -n "$D" ] || return 0
+	if [ "$IPV6G" = "1" ]; then
+		echo "nftset=/$D/4#inet#$NFT_NAME#${2}4,6#inet#$NFT_NAME#${2}6"
+	else
+		echo "nftset=/$D/4#inet#$NFT_NAME#${2}4"
+	fi
+}
+
+gen_dns()
+{
+	OUT=$(strip_old_dns)
+	OUT="$OUT
+### SSSPLIT-BEGIN ###"
+	if [ "$ENABLED" = "1" ]; then
+		L=$(dns_line $BASE/proxy_domains.txt destproxy_v); [ -n "$L" ] && OUT="$OUT
+$L"
+		L=$(dns_line $BASE/direct_domains.txt destdirect_v); [ -n "$L" ] && OUT="$OUT
+$L"
+	fi
+	OUT="$OUT
+### SSSPLIT-END ###"
+	echo "$OUT" > /etc/dnsmasq.conf
+}
+
+# ---------------------------------------------------------------- actions
+flush_all()
+{
+	monitor_stop
+	stop_engine
+	nft delete table inet $NFT_NAME >/dev/null 2>&1
+	ip rule del fwmark 1 table 100 >/dev/null 2>&1
+	ip route del local default dev lo table 100 >/dev/null 2>&1
+}
+
+do_stop()
+{
+	load_cfg
+	flush_all
+	gen_dns
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	rm -rf $RUN
+	log "stopped"
+	echo stopped
+}
+
+do_start()
+{
+	load_cfg
+	if [ "$ENABLED" != "1" ]; then echo disabled; return 1; fi
+	if [ -z "$SRV" ]; then echo noserver; log "ERROR: no enabled server in config"; return 1; fi
+	start_engine || return 1
+	gen_nft || return 1
+	gen_dns
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	monitor_start
+	log "started engine=$ENGINE server=$SHOST:$SPORT mode=$MODE"
+	echo started
+}
+
+do_apply()
+{
+	load_cfg
+	if [ "$(gget global.pick manual)" = "auto" ] && [ -z "$SSSPLIT_NOPICK" ]; then
+		log "auto pick enabled: probing servers"
+		auto_pick >/dev/null 2>&1
+		load_cfg
+	fi
+	if [ "$ENABLED" != "1" ]; then
+		do_stop
+		return 0
+	fi
+	flush_all
+	do_start
+}
+
+do_status()
+{
+	load_cfg
+	echo "enabled=$ENABLED"
+	echo "engine=$ENGINE"
+	echo "mode=$MODE"
+	echo "tcp_port=$TP"
+	echo "udp_relay=$UDP_ON"
+	echo "udp_port=$UP"
+	echo "ipv6=$IPV6G"
+	echo "server=$SHOST:$SPORT"
+	if [ -n "$SRV" ]; then
+		echo "server_enabled=1"
+		echo "server_method=$SMETHOD"
+		echo "server_proto=$SPROTO/$SOBF"
+	else
+		echo "server_enabled=0"
+	fi
+	if engine_alive $RUN/proxy.pid; then
+		echo "running=1"
+		echo "pid=$(cat $RUN/proxy.pid)"
+	else
+		echo "running=0"
+	fi
+	# which services are actually running
+	echo "proc_sslocal=$(ps 2>/dev/null | awk '/[s]slocal/ {n++} END{print n+0}')"
+	echo "proc_ssr=$(ps 2>/dev/null | awk '/[s]sr-(redir|local|libev)/ {n++} END{print n+0}')"
+	echo "proc_ipt2socks=$(ps 2>/dev/null | awk '/[i]pt2socks/ {n++} END{print n+0}')"
+	echo "proc_doh=$(ps 2>/dev/null | awk '/[h]ttps-dns-proxy/ {n++} END{print n+0}')"
+	if [ -f $RUN/monitor.pid ] && kill -0 $(cat $RUN/monitor.pid 2>/dev/null) 2>/dev/null; then
+		echo "proc_monitor=1"
+	else
+		echo "proc_monitor=0"
+	fi
+	echo "monitor_interval=$(uci -q get $CFG.global.pick_interval 2>/dev/null)"
+	if nft list table inet $NFT_NAME >/dev/null 2>&1; then
+		echo "nft=1"
+		nft list chain inet $NFT_NAME dstnat 2>/dev/null | awk '{
+			if (match($0,/packets ([0-9]+)/)) p=substr($0,RSTART+8,RLENGTH-8); else p=0;
+			if (match($0,/bytes ([0-9]+)/)) b=substr($0,RSTART+6,RLENGTH-6); else b=0;
+			if ($0 ~/redirect/) { pk=p+pk; by=b+by }
+		} END { printf "redirect_packets=%d\nredirect_bytes=%d\n", pk+0, by+0 }'
+		echo "set_proxy_v4=$(nft list set inet $NFT_NAME destproxy_v4 2>/dev/null | awk '/elements =/{n=split($0,a,",")}END{print n+0}')"
+		echo "set_direct_v4=$(nft list set inet $NFT_NAME destdirect_v4 2>/dev/null | awk '/elements =/{n=split($0,a,",")}END{print n+0}')"
+	else
+		echo "nft=0"
+		echo "redirect_packets=0"
+		echo "redirect_bytes=0"
+	fi
+	echo "list_proxy_domains=$(awk '!/^#/&&NF' $BASE/proxy_domains.txt 2>/dev/null | wc -l)"
+	echo "list_direct_domains=$(awk '!/^#/&&NF' $BASE/direct_domains.txt 2>/dev/null | wc -l)"
+	echo "list_proxy_ip=$(awk '!/^#/&&NF' $BASE/proxy_ip.list 2>/dev/null | wc -l)"
+	echo "list_direct_ip=$(awk '!/^#/&&NF' $BASE/direct_ip.list 2>/dev/null | wc -l)"
+	for k in $(printf '%s\n' $ITDOG_SOURCES | awk -F'|' '{print $1}'); do
+		echo "itdog_src_$k=$(uci -q get $CFG.global.itdog_src_$k 2>/dev/null)"
+	done
+	return 0
+}
+
+do_test()
+{
+	load_cfg
+	if [ -z "$SHOST" ]; then echo "error=server_not_set"; return 1; fi
+	echo "target=$SHOST:$SPORT"
+	case "$SHOST" in
+		127.0.0.1|localhost|0.0.0.0) echo "tcp=ok(local)"; return 0 ;;
+	esac
+	echo | timeout 4 nc -w 4 "$SHOST" "$SPORT" >/dev/null 2>&1 && echo "tcp=ok" || echo "tcp=fail"
+	return 0
+}
+
+# ---------------------------------------------------------------- dns monitoring
+dns_provider_of()
+{
+	case "$1" in
+		*adguard-dns.com*|*adguard.com*) echo adguard ;;
+		*comss*) echo comss ;;
+		*cloudflare-dns.com*|*cloudflare.com*) echo cloudflare ;;
+		*dns.google*|*google.com*) echo google ;;
+		*) echo custom ;;
+	esac
+}
+
+do_dns_status()
+{
+	echo -n ""
+	opkg list-installed 2>/dev/null | grep -q '^https-dns-proxy ' && echo "doh_installed=1" || echo "doh_installed=0"
+	DRUN=$(ps 2>/dev/null | awk '/[h]ttps-dns-proxy/ {n++} END{print n+0}')
+	echo "doh_process=$DRUN"
+	N=0
+	for s in $(uci -q show https-dns-proxy 2>/dev/null | sed -n 's/^https-dns-proxy\.\([^.=]*\)=https-dns-proxy$/\1/p'); do
+		URL=$(uci -q get https-dns-proxy.$s.resolver_url)
+		BS=$(uci -q get https-dns-proxy.$s.bootstrap_dns)
+		echo "doh${N}_url=$URL"
+		echo "doh${N}_bootstrap=$BS"
+		echo "doh${N}_provider=$(dns_provider_of "$URL")"
+		N=$((N + 1))
+	done
+	echo "doh_instances=$N"
+	echo "dnsmasq_noresolv=$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null || echo 0)"
+	echo "dnsmasq_server=$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr ' ' ',')"
+	if [ "$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)" != "1" ] && [ -s /tmp/resolv.conf.d/resolv.conf.auto ]; then
+		echo "plain_upstreams=$(grep -c '^nameserver' /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null)"
+		echo "leak=1"
+	else
+		PLAIN=0
+		for svr in $(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null); do
+			case "$svr" in
+				/*) ;; # domain-scoped entries (e.g. /mask.icloud.com/) are not servers
+				127.0.0.1*|::1*) ;;
+				*) PLAIN=$((PLAIN + 1)) ;;
+			esac
+		done
+		echo "plain_upstreams=$PLAIN"
+		echo "leak=$([ $PLAIN -gt 0 ] && echo 1 || echo 0)"
+	fi
+	echo "force_dns=$(uci -q get https-dns-proxy.config.force_dns 2>/dev/null || echo 0)"
+	echo "sssplit_dns_rules=$(grep -q 'SSSPLIT-BEGIN' /etc/dnsmasq.conf 2>/dev/null && echo 1 || echo 0)"
+	T0=$(date +%s)
+	HB_OUT=$(nslookup heartbeat.mossdef.org 127.0.0.1 2>/dev/null)
+	HBRC=1
+	nslookup heartbeat.mossdef.org 127.0.0.1 >/dev/null 2>&1 && HBRC=0
+	T1=$(date +%s)
+	if [ "$HBRC" = "0" ]; then
+		echo "heartbeat=ok"
+		echo "heartbeat_ip=$(echo "$HB_OUT" | awk '/Address:/ {v=$NF} END {print v}' | sed 's/:[0-9]*$//')"
+	else
+		echo "heartbeat=fail"
+	fi
+	echo "heartbeat_s=$((T1 - T0))"
+	return 0
+}
+
+do_dns_fix()
+{
+	load_cfg
+	PROV="$1"
+	case "$PROV" in
+		adguard)    URL='https://dns.adguard-dns.com/dns-query';  BS='94.140.14.49,94.140.14.50' ;;
+		comss)      URL='https://dns.comss.one/dns-query';        BS='83.220.169.155,212.109.195.93' ;;
+		cloudflare) URL='https://cloudflare-dns.com/dns-query';   BS='1.1.1.1,1.0.0.1' ;;
+		google)     URL='https://dns.google/dns-query';           BS='8.8.8.8,8.8.4.4' ;;
+		*) echo "error=unknown_provider; usage: sssplit-ctl dns-fix {adguard|comss|cloudflare|google}"; return 1 ;;
+	esac
+	uci set https-dns-proxy.@https-dns-proxy[0].resolver_url="$URL"
+	uci set https-dns-proxy.@https-dns-proxy[0].bootstrap_dns="$BS"
+	# keep instance 1 (if any) as a redundant fallback on Cloudflare
+	if uci -q get https-dns-proxy.@https-dns-proxy[1] >/dev/null 2>&1; then
+		case "$PROV" in
+			cloudflare)
+				uci set https-dns-proxy.@https-dns-proxy[1].resolver_url='https://dns.google/dns-query'
+				uci set https-dns-proxy.@https-dns-proxy[1].bootstrap_dns='8.8.8.8,8.8.4.4'
+				;;
+		esac
+	fi
+	uci set sssplit.global.doh_provider="$PROV"
+	uci set sssplit.global.doh_url="$URL"
+	uci commit https-dns-proxy
+	uci commit sssplit
+	/etc/init.d/https-dns-proxy restart >/dev/null 2>&1
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	sleep 3
+	echo "fixed=1"
+	echo "provider=$PROV"
+	if nslookup heartbeat.mossdef.org 127.0.0.1 >/dev/null 2>&1; then
+		echo "heartbeat=ok"
+	else
+		echo "heartbeat=fail"
+		log "dns-fix $PROV: heartbeat FAILED after switch"
+	fi
+	return 0
+}
+
+# ---------------------------------------------------------------- ss:// import
+b64dec()
+{
+	echo "$1" | sed 's/-/+/g; s/_/\//' | awk '
+		BEGIN{
+			b64="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+			for(i=0;i<64;i++) V[substr(b64,i+1,1)]=i
+		}
+		{
+			n=length($0); acc=0; nb=0; out=""
+			for(j=1;j<=n;j++){
+				c=substr($0,j,1)
+				if(c=="=" || c==" " || c=="\r") continue
+				v=V[c]; if(v=="") continue
+				acc=acc*64+v; nb+=6
+				while(nb>=8){
+					nb-=8
+					out=out sprintf("%c", int(acc/2^nb))
+					acc=acc%(2^nb)
+				}
+			}
+			printf "%s", out
+		}'
+}
+
+urlunesc() { echo "$1" | sed 's/+/ /g; s/%20/ /g; s/%3A/:/gi; s/%2F/\//gi; s/%40/@/gi; s/%26/\&/g; s/%3D/=/gi; s/%3F/?/gi; s/%23/#/gi'; }
+
+do_add_uri()
+{
+	load_cfg
+	U="$1"
+	case "$U" in ss://*) ;; *) echo "error=not_ss_uri"; return 1 ;; esac
+	RAW="${U#ss://}"
+	NAME=""
+	QUERY=""
+	if [ "${RAW#*#}" != "$RAW" ]; then
+		NAME=$(urlunesc "${RAW#*#}")
+		NAME=${NAME%%\?*}
+		RAW="${RAW%%#*}"
+	fi
+	if [ "${RAW#*\?}" != "$RAW" ]; then
+		QUERY="${RAW#*\?}"
+		RAW="${RAW%%\?*}"
+	fi
+	case "$RAW" in *@*) ;; *) echo "error=bad_uri_no_at"; return 1 ;; esac
+	USERINFO="${RAW%@*}"
+	HOSTPORT="${RAW#*@}"
+
+	if [ "${USERINFO#*:}" != "$USERINFO" ]; then
+		METHOD="${USERINFO%%:*}"
+		PASS="${USERINFO#*:}"
+	else
+		D=$(b64dec "$USERINFO")
+		case "$D" in *:*) METHOD="${D%%:*}"; PASS="${D#*:}" ;; *) echo "error=bad_base64"; return 1 ;; esac
+	fi
+	case "$HOSTPORT" in \[*\]*) # [v6] or [v6]:port
+		HOST="${HOSTPORT%%]*}"; HOST="${HOST#\[}"
+		REST="${HOSTPORT#*]}"
+		case "$REST" in :*) PORT="${REST#*:}" ;; *) PORT="8388" ;; esac
+		;;
+	*:*) HOST="${HOSTPORT%:*}"; PORT="${HOSTPORT##*:}" ;;
+	*) HOST="$HOSTPORT"; PORT="8388" ;;
+	esac
+	HOST=$(echo "$HOST" | sed 's|/.*$||')
+	PASS=$(echo "$PASS" | sed 's|/.*$||')
+
+	[ -n "$METHOD" ] && [ -n "$PASS" ] && [ -n "$HOST" ] || { echo "error=parse_failed"; return 1; }
+	case "$PORT" in *[!0-9]*) echo "error=bad_port"; return 1 ;; esac
+
+	# disable other enabled servers: exactly one must be enabled
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		uci -q set "$CFG.$s.enabled=0"
+	done
+	SID=$(uci add sssplit server)
+	uci set "$CFG.$SID=server"
+	uci set "$CFG.$SID.name=$NAME"
+	uci set "$CFG.$SID.host=$HOST"
+	uci set "$CFG.$SID.port=$PORT"
+	uci set "$CFG.$SID.method=$METHOD"
+	uci set "$CFG.$SID.password=$PASS"
+	uci set "$CFG.$SID.protocol=origin"
+	uci set "$CFG.$SID.obfs=plain"
+	uci set "$CFG.$SID.enabled=1"
+	ENGINE=ssr
+	case "$METHOD" in
+		*-gcm*|*poly1305*|2022-*|*-*gcm) ENGINE=rust ;;
+	esac
+	uci set "$CFG.global.engine=$ENGINE"
+	uci commit sssplit
+	log "added server from ss:// link: $HOST:$PORT method=$METHOD engine=$ENGINE"
+	echo "added=$SID"
+	echo "name=$NAME"
+	echo "host=$HOST"
+	echo "port=$PORT"
+	echo "method=$METHOD"
+	echo "password=$PASS"
+	echo "engine=$ENGINE"
+	case "$ENGINE" in
+		rust) [ -x /tmp/sslocal ] || echo "hint=engine_rust_needs_sslocal" ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------- server health / auto pick
+method_engine()
+{
+	case "$1" in
+		*-gcm*|*poly1305*|2022-*) echo rust ;;
+		*) echo ssr ;;
+	esac
+}
+
+nc_probe()
+{
+	H="$1" P="$2"
+	PT=$(uci -q get $CFG.global.probe_to 2>/dev/null)
+	case "$PT" in ''|*[!0-9]*) PT=3 ;; esac
+	[ "$PT" -gt 0 ] || PT=3
+	if command -v timeout >/dev/null 2>&1; then
+		echo "" | timeout $PT nc "$H" "$P" >/dev/null 2>&1
+	else
+		nc "$H" "$P" </dev/null >/dev/null 2>&1 &
+		NP=$!
+		( sleep $PT; kill $NP 2>/dev/null ) &
+		KP=$!
+		wait $NP 2>/dev/null
+		kill $KP 2>/dev/null
+		return $?
+	fi
+}
+
+srv_latency()
+{
+	H="$1" P="$2"
+	[ -n "$H" ] || return 1
+	U0=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+	nc_probe "$H" "$P" || return 1
+	U1=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)
+	awk -v a="$U0" -v b="$U1" 'BEGIN{d=b-a; if(d<0)d=0; printf "%.2f", d}'
+}
+
+do_check()
+{
+	load_cfg
+	N=0
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		H=$(uci -q get $CFG.$s.host)
+		[ -n "$H" ] || continue
+		P=$(uci -q get $CFG.$s.port)
+		NM=$(uci -q get $CFG.$s.name)
+		M=$(uci -q get $CFG.$s.method)
+		L=$(srv_latency "$H" "$P")
+		if [ -n "$L" ]; then UP=1; else UP=0; L="-"; fi
+		# persist for the UI (Servers tab shows a status/ping column)
+		if [ "$UP" = "1" ]; then
+			ST="$L c"
+		else
+			ST="недоступен"
+		fi
+		uci -q set "$CFG.$s.last_ok=$UP"
+		uci -q set "$CFG.$s.stat=$ST"
+		uci -q set "$CFG.$s.checked=$(date +%s)"
+		echo "srv${N}_id=$s"
+		echo "srv${N}_name=$NM"
+		echo "srv${N}_target=$H:$P"
+		echo "srv${N}_method=$M"
+		echo "srv${N}_up=$UP"
+		echo "srv${N}_latency=$L"
+		N=$((N + 1))
+	done
+	uci commit sssplit
+	echo "servers=$N"
+	return 0
+}
+
+auto_pick()
+{
+	# candidates = servers flagged "enabled" (pool); if none flagged, fall back to all
+	CAND=""
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		[ "$(uci -q get $CFG.$s.enabled)" = "1" ] && CAND="$CAND $s"
+	done
+	[ -n "$CAND" ] || CAND=$(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p")
+	BEST="" BESTL=""
+	for s in $CAND; do
+		H=$(uci -q get $CFG.$s.host)
+		[ -n "$H" ] || continue
+		case "$H" in 127.0.0.1|localhost|0.0.0.0|::1) continue ;; esac
+		P=$(uci -q get $CFG.$s.port)
+		L=$(srv_latency "$H" "$P") || continue
+		if [ -z "$BEST" ]; then
+			BEST="$s" BESTL="$L"
+		elif awk -v c="$L" -v b="$BESTL" 'BEGIN{exit !(c<b)}'; then
+			BEST="$s" BESTL="$L"
+		fi
+	done
+	if [ -z "$BEST" ]; then
+		echo "picked=none"
+		log "auto pick: no reachable server"
+		return 1
+	fi
+	# remember the choice in a separate field; do not touch the "enabled" pool flags
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		if [ "$s" = "$BEST" ]; then uci -q set "$CFG.$s.active=1"; else uci -q set "$CFG.$s.active=0"; fi
+	done
+	ME=$(uci -q get $CFG.$BEST.method)
+	uci set "$CFG.global.engine=$(method_engine "$ME")"
+	uci commit sssplit
+	log "auto pick: $BEST ($BESTL s)"
+	echo "picked=$BEST"
+	echo "picked_target=$(uci -q get $CFG.$BEST.host):$(uci -q get $CFG.$BEST.port)"
+	echo "picked_latency=$BESTL"
+	return 0
+}
+
+do_pick_auto()
+{
+	auto_pick || return 1
+	# restart the chain right away, using the server just picked (no second probe)
+	SSSPLIT_NOPICK=1 do_apply
+}
+
+# ---------------------------------------------------------------- background auto pick monitor
+_monitor_enabled()
+{
+	INT=$(uci -q get $CFG.global.pick_interval 2>/dev/null)
+	case "$INT" in ''|*[!0-9]*) INT=0 ;; esac
+	[ "$INT" -gt 0 ] && return 0 || return 1
+}
+
+monitor_start()
+{
+	_monitor_enabled || return 0
+	mkdir -p $RUN
+	monitor_stop
+	( setsid /usr/bin/sssplit-ctl monitor >/dev/null 2>&1 & echo $! > $RUN/monitor.pid )
+	log "monitor: started (interval $(uci -q get $CFG.global.pick_interval) s)"
+}
+
+monitor_stop()
+{
+	[ -f $RUN/monitor.pid ] || return 0
+	kill $(cat $RUN/monitor.pid) 2>/dev/null
+	rm -f $RUN/monitor.pid
+}
+
+_active_server()
+{
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		[ "$(uci -q get $CFG.$s.active)" = "1" ] && echo "$s" && break
+	done
+}
+
+do_monitor()
+{
+	load_cfg
+	mkdir -p $RUN
+	# single instance protection: exit if a live monitor exists
+	if [ -f $RUN/monitor.pid ]; then
+		OLD=$(cat $RUN/monitor.pid 2>/dev/null)
+		if [ -n "$OLD" ] && [ "$OLD" != "$$" ] && kill -0 "$OLD" 2>/dev/null; then
+			exit 0
+		fi
+	fi
+	echo $$ > $RUN/monitor.pid
+	while :; do
+		_monitor_enabled || break
+		INT=$(uci -q get $CFG.global.pick_interval)
+		sleep "$INT"
+		CUR=$(_active_server)
+		auto_pick >/dev/null 2>&1 || continue
+		NEW=$(_active_server)
+		if [ -n "$NEW" ] && [ "$NEW" != "$CUR" ]; then
+			log "monitor: $CUR -> $NEW, reloading chain"
+			SSSPLIT_NOPICK=1 do_apply
+			load_cfg
+		fi
+	done
+}
+
+install_rust()
+{
+	load_cfg
+	prepare_rust && { echo rust_ready; return 0; }
+	echo rust_fail
+	return 1
+}
+
+# ---------------------------------------------------------------- itdog (podkop) list sync
+# catalog: key|kind(dom=proxy domains, dir=direct domains, ip=v4 subnets)|path in repo
+RAW='https://raw.githubusercontent.com/itdoginfo/allow-domains/main'
+ITDOG_SOURCES='
+domains|dom|Russia/inside-raw.lst
+d_out|dir|Russia/outside-raw.lst
+s_youtube|dom|Services/youtube.lst
+s_meta|dom|Services/meta.lst
+s_twitter|dom|Services/twitter.lst
+s_discord|dom|Services/discord.lst
+s_telegram|dom|Services/telegram.lst
+s_tiktok|dom|Services/tiktok.lst
+s_googleai|dom|Services/google_ai.lst
+s_gplay|dom|Services/google_play.lst
+s_gmeet|dom|Services/google_meet.lst
+s_cloudflare|dom|Services/cloudflare.lst
+s_cloudfront|dom|Services/cloudfront.lst
+s_hdrezka|dom|Services/hdrezka.lst
+c_block|dom|Categories/block.lst
+c_geoblock|dom|Categories/geoblock.lst
+c_news|dom|Categories/news.lst
+c_anime|dom|Categories/anime.lst
+c_hodca|dom|Categories/hodca.lst
+c_porn|dom|Categories/porn.lst
+meta|ip|Subnets/IPv4/meta.lst
+cloudflare|ip|Subnets/IPv4/cloudflare.lst
+cloudfront|ip|Subnets/IPv4/cloudfront.lst
+twitter|ip|Subnets/IPv4/twitter.lst
+discord|ip|Subnets/IPv4/discord.lst
+telegram|ip|Subnets/IPv4/telegram.lst
+ip_digitalocean|ip|Subnets/IPv4/digitalocean.lst
+ip_hetzner|ip|Subnets/IPv4/hetzner.lst
+ip_ovh|ip|Subnets/IPv4/ovh.lst
+ip_roblox|ip|Subnets/IPv4/roblox.lst
+ip_gmeet|ip|Subnets/IPv4/google_meet.lst
+'
+# sources enabled by default when unset (original set)
+itdog_default_on()
+{
+	case "$1" in
+		domains|meta|cloudflare|cloudfront|twitter|discord|telegram) return 0 ;;
+	esac
+	return 1
+}
+
+# $1=url $2=outfile ; raw.githubusercontent.com -> jsDelivr fallback, wget -> uclient-fetch
+dl_one()
+{
+	wget -q -T 45 "$1" -O "$2" >/dev/null 2>&1
+	[ $? -eq 0 ] && [ -s "$2" ] && return 0
+	ALT=""
+	case "$1" in
+		https://raw.githubusercontent.com/*)
+			ALT=$(echo "$1" | sed -e 's|https://raw.githubusercontent.com/|https://cdn.jsdelivr.net/gh/|' -e 's|/main/|@main/|')
+			;;
+	esac
+	for U in "$ALT" "$1"; do
+		[ -n "$U" ] || continue
+		wget -q -T 45 "$U" -O "$2" >/dev/null 2>&1
+		[ $? -eq 0 ] && [ -s "$2" ] && return 0
+		uclient-fetch -q -T 45 "$U" -O "$2" >/dev/null 2>&1
+		[ $? -eq 0 ] && [ -s "$2" ] && return 0
+	done
+	return 1
+}
+
+# $1=kind(domains|ip) $2=target file $3=space separated urls
+merge_list()
+{
+	KIND="$1" TGT="$2" URLS="$3"
+	NEW=$RUN/.merge_new
+	: > "$NEW"
+	OK=0 FAIL=0
+	i=0
+	for u in $URLS; do
+		i=$((i + 1))
+		if dl_one "$u" "$RUN/.dl_$i" && [ -s "$RUN/.dl_$i" ]; then
+			OK=$((OK + 1))
+			case "$KIND" in
+				ip) awk '/^[0-9a-fA-F]/ && NF' "$RUN/.dl_$i" >> "$NEW" ;;
+				*)  awk '!/^#/&&NF { gsub(/\r/,""); sub(/\.$/,""); print }' "$RUN/.dl_$i" >> "$NEW" ;;
+			esac
+		else
+			FAIL=$((FAIL + 1))
+		fi
+		rm -f "$RUN/.dl_$i"
+	done
+	if [ ! -s "$NEW" ]; then
+		echo "${KIND}_added=0"
+		echo "${KIND}_skip=all_sources_failed(ok=$OK fail=$FAIL)"
+		return 1
+	fi
+	sort -u -o "$NEW" "$NEW"
+	# keep manual entries, replace the previous auto block
+	if [ -s "$TGT" ]; then
+		awk '!/^# --- itdog\/auto/' "$TGT" > "$RUN/.manual_u"
+		awk '!/^#/&&NF' "$RUN/.manual_u" | sort -u > "$RUN/.manual_u2"
+	else
+		: > "$RUN/.manual_u2"
+	fi
+	# absent = new entries not already present manually
+	# busybox has no comm; use awk with a first-file marker so empty manual part is safe
+	printf '__MANUAL__\n' > "$RUN/.merge_excl"
+	cat "$RUN/.manual_u2" >> "$RUN/.merge_excl"
+	sort -u "$NEW" > "$RUN/.merge_new2"
+	awk 'BEGIN{m=ARGV[1]} FILENAME==m { seen[$0]=1; next } !($0 in seen)' "$RUN/.merge_excl" "$RUN/.merge_new2" > "$TGT.absent"
+	# rebuild the file: manual part + auto block
+	if [ -s "$RUN/.manual_u2" ]; then
+		cp "$RUN/.manual_u2" "$TGT.new"
+	else
+		: > "$TGT.new"
+	fi
+	echo "# --- itdog/auto $(date '+%Y-%m-%d %H:%M') ($OK src, fail=$FAIL) ---" >> "$TGT.new"
+	cat "$TGT.absent" >> "$TGT.new"
+	mv "$TGT.new" "$TGT"
+	N=$(wc -l < "$TGT.absent" | tr -d ' ')
+	rm -f "$TGT.absent" "$RUN/.manual_u" "$RUN/.manual_u2" "$RUN/.merge_excl" "$RUN/.merge_new2" "$NEW"
+	echo "${KIND}_added=$N"
+	echo "${KIND}_sources=ok=$OK fail=$FAIL"
+}
+
+do_enable_servers()
+{
+	V="$1"
+	case "$V" in 1|0) ;; *) V=1 ;; esac
+	N=0
+	for s in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^$CFG\.\(.*\)=server\$/\1/p"); do
+		uci -q set "$CFG.$s.enabled=$V"
+		N=$((N + 1))
+	done
+	uci commit sssplit
+	echo "set_enabled=$V servers=$N"
+}
+
+# toggle an itdog source (by key from ITDOG_SOURCES)
+do_itdog_src()
+{
+	K="$1" V="$2"
+	case "$V" in 1|0) ;; *) V=1 ;; esac
+	ISRC=$(printf '%s\n' $ITDOG_SOURCES | awk -F'|' -v k="$K" '$1==k{print 1; exit}')
+	[ "$ISRC" = "1" ] || { echo "key=invalid"; return 1; }
+	uci set "$CFG.global.itdog_src_$K=$V"
+	uci commit sssplit
+	echo "itdog_src_$K=$V"
+}
+
+do_update_lists()
+{
+	load_cfg
+	mkdir -p $RUN
+	# compose per-target url lists from the catalog; custom URL overrides from settings win
+	DU="" IU="" OU=""
+	for spec in $ITDOG_SOURCES; do
+		KEY=${spec%%|*}
+		R=${spec#*|}
+		K=${R%%|*}
+		P=${R#*|}
+		case "$(uci -q get $CFG.global.itdog_src_$KEY 2>/dev/null)" in
+			1) ;;
+			0) continue ;;
+			*) itdog_default_on "$KEY" || continue ;;
+		esac
+		case "$K" in
+			dom) DU="$DU $RAW/$P" ;;
+			dir) OU="$OU $RAW/$P" ;;
+			ip)  IU="$IU $RAW/$P" ;;
+		esac
+	done
+	CU=$(uci -q get "$CFG.global.list_domains_url")
+	[ -n "$CU" ] && DU="$CU"
+	CU=$(uci -q get "$CFG.global.list_ip_url")
+	[ -n "$CU" ] && IU="$CU"
+	if [ -n "$DU" ]; then
+		merge_list domains "$BASE/proxy_domains.txt" "$DU"
+	else
+		echo "domains_added=0"
+		echo "domains_sources=skip (no domain sources enabled)"
+	fi
+	if [ -n "$OU" ]; then
+		merge_list direct "$BASE/direct_domains.txt" "$OU"
+	else
+		echo "direct_added=0"
+		echo "direct_sources=skip (no direct sources enabled)"
+	fi
+	if [ -n "$IU" ]; then
+		merge_list ip "$BASE/proxy_ip.list" "$IU"
+	else
+		echo "ip_added=0"
+		echo "ip_sources=skip (no ip sources enabled)"
+	fi
+	if [ "$(uci -q get $CFG.global.enabled)" = "1" ]; then
+		SSSPLIT_NOPICK=1 do_apply
+	fi
+}
+
+case "$1" in
+	start) do_start ;;
+	stop) do_stop ;;
+	apply) do_apply ;;
+	status) do_status ;;
+	test) do_test ;;
+	check) do_check ;;
+	pick-auto) do_pick_auto ;;
+	dns-status) do_dns_status ;;
+	dns-fix) shift; do_dns_fix "$@" ;;
+	add-uri) shift; do_add_uri "$@" ;;
+	install-rust) install_rust ;;
+	monitor) do_monitor ;;
+	update-lists) do_update_lists ;;
+	enable-servers) do_enable_servers "$2" ;;
+	itdog-src) do_itdog_src "$2" "$3" ;;
+	*) echo "usage: sssplit-ctl {start|stop|apply|status|test|check|pick-auto|dns-status|dns-fix|add-uri|install-rust|update-lists|monitor|enable-servers|itdog-src}" ;;
+esac
+
+exit $?

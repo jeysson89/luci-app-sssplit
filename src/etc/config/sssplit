@@ -1,0 +1,12 @@
+
+config global 'global'
+	option enabled '0'
+	option engine 'ssr'
+	option mode 'by_list'
+	option tcp_port '1080'
+	option udp_relay '0'
+	option udp_port '1090'
+	option ipv6 '0'
+	option pick 'auto'
+	option pick_interval '60'
+	option probe_to '3'
