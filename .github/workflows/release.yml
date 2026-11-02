@@ -63,3 +63,20 @@ jobs:
           # keep stable filename for install.sh (releases/latest/download/luci-app-sssplit_all.ipk)
           cp dist/luci-app-sssplit_${{ steps.ver.outputs.ver }}_all.ipk dist/luci-app-sssplit_all.ipk
           gh release upload "${{ steps.ver.outputs.tag }}" --clobber dist/luci-app-sssplit_all.ipk
+          # ship the rust engine (sslocal) ipk in every release: the ctl default
+          # rust_url points to releases/latest/download/sslocal-...ipk, and
+          # passwall2 bundles ipks in zips now, so re-host it here
+          pwtag=$(curl -sq https://api.github.com/repos/Openwrt-Passwall/openwrt-passwall2/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+          echo "passwall2 latest: $pwtag"
+          curl -sL -o /tmp/pw.zip "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/${pwtag}/packages_ipk_mipsel_24kc.zip" || true
+          sslocal=$(cd /tmp && python3 - /tmp/pw.zip <<'PYEOF'
+          import sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          n = [x for x in z.namelist() if 'sslocal' in x][0]
+          z.extract(n, '/tmp')
+          print('/tmp/' + n)
+          PYEOF
+          )
+          [ -s "$sslocal" ] && mv "$sslocal" /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk && ls -la /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk
+          gh release upload "${{ steps.ver.outputs.tag }}" --clobber /tmp/sslocal-1.25.0-r1_mipsel_24kc.ipk \
+          || echo "WARN: sslocal asset upload skipped"
