@@ -44,9 +44,10 @@ jobs:
               name = hdr[:16].decode().strip()
               size = int(hdr[48:58].decode().strip())
               assert name == want, f'bad member name: {name!r} (trailing slash?)'
+              body = data[pos+60:pos+60+size]
               pos += 60 + size + (size & 1)
               seen.append(name)
-              open(want, 'wb').write(data[pos-size:pos])
+              open(want, 'wb').write(body)
           assert seen == names, seen
           print('ar members OK:', ', '.join(seen))
           PYEOF
