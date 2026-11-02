@@ -68,23 +68,9 @@ OUT="$ROOT/dist"
 mkdir -p "$OUT"
 rm -f "$OUT/${PKG}_${VER}_all.ipk" "$OUT/${PKG}_all.ipk"
 
-# pack the ar container in (pure) python: GNU ar writes member names with a
-# trailing '/' ("control.tar.gz/"), which opkg rejects as a malformed package
-( cd "$BUILD" && python3 - "$OUT/${PKG}_${VER}_all.ipk" <<'PYEOF'
-import sys, os
-out, names = sys.argv[1], ['debian-binary', 'control.tar.gz', 'data.tar.gz']
-with open(out, 'wb') as f:
-    f.write(b'!<arch>\n')
-    for n in names:
-        d = open(n, 'rb').read()
-        hdr  = n.encode().ljust(16)[:16]
-        hdr += str(int(os.path.getmtime(n))).ljust(12).encode()
-        hdr += b'0'.ljust(6); hdr += b'0'.ljust(6)
-        hdr += b'644'.ljust(8)
-        hdr += str(len(d)).ljust(10).encode()
-        hdr += b'`\n'
-        f.write(hdr + d + (b'\n' if len(d) % 2 else b''))
-PYEOF
-)
+# pack the ipk as a gzip'd tar: OpenWrt 23.05+/24.10 opkg expects
+# ./debian-binary, ./control.tar.gz, ./data.tar.gz (the old ar container is
+# rejected as "Malformed package file")
+( cd "$BUILD" && tar -czf "$OUT/${PKG}_${VER}_all.ipk" ./debian-binary ./control.tar.gz ./data.tar.gz )
 cp -f "$OUT/${PKG}_${VER}_all.ipk" "$OUT/${PKG}_all.ipk"
 echo "Built: dist/${PKG}_${VER}_all.ipk"

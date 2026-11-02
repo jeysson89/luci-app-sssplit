@@ -31,28 +31,22 @@ jobs:
       - name: smoke test archive
         run: |
           cd dist
-          # opkg requires ar member names WITHOUT trailing slash (GNU ar writes
-          # "control.tar.gz/" which opkg rejects) — verify with pure python
-          python3 - luci-app-sssplit_*.ipk <<'PYEOF'
-          import sys
-          names = ['debian-binary', 'control.tar.gz', 'data.tar.gz']
-          data = open(sys.argv[1], 'rb').read()
-          assert data[:8] == b'!<arch>\n', 'not an ar archive'
-          pos, seen = 8, []
-          for want in names:
-              hdr = data[pos:pos+60]
-              name = hdr[:16].decode().strip()
-              size = int(hdr[48:58].decode().strip())
-              assert name == want, f'bad member name: {name!r} (trailing slash?)'
-              body = data[pos+60:pos+60+size]
-              pos += 60 + size + (size & 1)
-              seen.append(name)
-              open(want, 'wb').write(body)
-          assert seen == names, seen
-          print('ar members OK:', ', '.join(seen))
+          bash -n ../build/build-ipk.sh && echo "build script syntax OK"
+          ipk="luci-app-sssplit_all.ipk"
+          # modern ipk = gzip'd tar with ./debian-binary, ./control.tar.gz, ./data.tar.gz
+          python3 - "$ipk" <<'PYEOF'
+          import sys, tarfile
+          p = sys.argv[1]
+          want = {'./debian-binary', './control.tar.gz', './data.tar.gz'}
+          with tarfile.open(p, 'r:gz') as t:
+              names = {m.name for m in t.getmembers()}
+              assert names == want, names
+              t.extract('./control.tar.gz', '.')
+              t.extract('./data.tar.gz', '.')
+          print('ipk members OK:', ', '.join(sorted(names)))
           PYEOF
-          tar -tzf control.tar.gz | grep -E '^\./control$'
-          tar -tzf data.tar.gz   | grep -E '^\./usr/bin/sssplit-ctl$'
+          tar -tzf control.tar.gz | grep -qE '^\./control$'
+          tar -tzf data.tar.gz   | grep -qE '^\./usr/bin/sssplit-ctl$'
           tar -xzOf data.tar.gz ./usr/bin/sssplit-ctl | sh -n && echo "ctl syntax OK"
           tar -xzOf control.tar.gz ./postinst | sh -n && echo "postinst syntax OK"
 
