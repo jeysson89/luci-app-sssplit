@@ -7,14 +7,14 @@
 #   or:  sh install.sh <github-user>
 #
 # What it does:
-#   1. opkg install ipt2socks (+ https-dns-proxy for the DoH tab,
-#      + shadowsocksr fallback for the classic ssr engine)
+#   1. opkg install ipt2socks + https-dns-proxy (DoH is REQUIRED:
+#      the app manages and displays it),
+#      + shadowsocksr fallback for the classic ssr engine
 #   2. downloads the latest luci-app-sssplit ipk from GitHub releases
 #   3. installs the app, enables the init script
 #   4. downloads sslocal (shadowsocks-rust, RAM) for the AEAD engine
 #
-# Flags:  --no-doh    skip https-dns-proxy
-#         --no-rust   skip sslocal download (classical ssr engine only)
+# Flags:  --no-rust   skip sslocal download (classical ssr engine only)
 # =====================================================================
 set -u
 
@@ -26,10 +26,9 @@ BASE="https://github.com/$REPO/releases/latest/download"
 IPK="luci-app-sssplit_all.ipk"
 TMP="/tmp/$IPK"
 
-NO_DOH=0; NO_RUST=0
+NO_RUST=0
 for a in "${2:-}" "${3:-}"; do
 	case "$a" in
-		--no-doh) NO_DOH=1 ;;
 		--no-rust) NO_RUST=1 ;;
 	esac
 done
@@ -42,11 +41,13 @@ say() { echo "==> $1"; }
 say "opkg update"
 opkg update >/dev/null 2>&1
 
-say "installing dependencies"
+say "installing dependencies (ipt2socks + https-dns-proxy are required)"
 opkg install ipt2socks                    >/dev/null 2>&1 || opkg install ipt2socks || { echo "ERR: ipt2socks"; exit 1; }
-if [ "$NO_DOH" = "0" ]; then
-	opkg install https-dns-proxy >/dev/null 2>&1 || { echo "WARN: https-dns-proxy not installed (DoH tab stays informational)"; }
-fi
+opkg install luci-app-https-dns-proxy     >/dev/null 2>&1 || true
+# DoH is mandatory for this app: ctl configures/restarts https-dns-proxy and
+# the Status tab reports it; fail the whole install when it is missing
+opkg install https-dns-proxy              >/dev/null 2>&1 || opkg install https-dns-proxy || { echo "ERR: https-dns-proxy (required)"; exit 1; }
+opkg list-installed | grep -q '^https-dns-proxy ' || { echo "ERR: https-dns-proxy not installed (required)"; exit 1; }
 # ssr engine fallback (AEAD engines need sslocal/rust instead)
 opkg install shadowsocksr-libev-ssr-redir >/dev/null 2>&1 \
 	|| opkg install shadowsocksr-libev    >/dev/null 2>&1 \

@@ -16,9 +16,9 @@ LuCI-приложение для OpenWrt: **раздельная маршрут�
 ```sh
 wget -qO- "https://raw.githubusercontent.com/jeysson89/luci-app-sssplit/main/install.sh" | sh -s -- jeysson89
 ```
-Скрипт: ставит `ipt2socks` (+ `https-dns-proxy`), качает последний ipk из Releases, устанавливает приложение и скачивает `sslocal` (shadowsocks-rust, работает из RAM — flash трогает только конфиг).
+Скрипт: ставит `ipt2socks` + `https-dns-proxy` (DoH — обязательная зависимость: приложение управляет им и показывает на вкладке Status), качает последний ipk из Releases, устанавливает приложение и скачивает `sslocal` (shadowsocks-rust, работает из RAM — flash трогает только конфиг).
 
-Флаги: `--no-doh` — без DoH, `--no-rust` — без sslocal (движок ssr).
+Флаг: `--no-rust` — без sslocal (движок ssr).
 
 ## Сборка ipk
 ```sh
