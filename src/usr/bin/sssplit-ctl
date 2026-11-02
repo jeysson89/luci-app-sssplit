@@ -20,7 +20,7 @@ load_cfg()
 	UP=$(gget global.udp_port 1090)
 	UDP_ON=$(gget global.udp_relay 0)
 	IPV6G=$(gget global.ipv6 0)
-	RUST_URL=$(gget global.rust_url "https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/26.10.29-1/shadowsocks-rust-sslocal_1.25.0-r1_mipsel_24kc.ipk")
+	RUST_URL=$(gget global.rust_url "https://github.com/jeysson89/luci-app-sssplit/releases/latest/download/sslocal-1.25.0-r1_mipsel_24kc.ipk")
 
 	SRV=""
 	# in auto mode the running server is the one auto_pick marked "active";
